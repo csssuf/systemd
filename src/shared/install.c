@@ -691,7 +691,10 @@ static int find_symlinks_fd(
                 int fd,
                 const char *path,
                 const char *config_path,
-                bool *same_name_link) {
+                bool *same_name_link,
+                char *dir_name,
+                Set *enable_masked_targets,
+                Set *enabled_targets) {
 
         _cleanup_closedir_ DIR *d = NULL;
         struct dirent *de;
@@ -702,6 +705,8 @@ static int find_symlinks_fd(
         assert(path);
         assert(config_path);
         assert(same_name_link);
+        assert(enable_masked_targets);
+        assert(enabled_targets);
 
         d = fdopendir(fd);
         if (!d) {
@@ -714,7 +719,7 @@ static int find_symlinks_fd(
                 dirent_ensure_type(d, de);
 
                 if (de->d_type == DT_DIR) {
-                        _cleanup_free_ char *p = NULL;
+                        _cleanup_free_ char *p = NULL, *d_name = NULL;
                         int nfd, q;
 
                         nfd = openat(fd, de->d_name, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
@@ -733,10 +738,14 @@ static int find_symlinks_fd(
                                 return -ENOMEM;
                         }
 
+                        d_name = strdup(de->d_name);
+                        if (!d_name) {
+                                r = -errno;
+                                continue;
+                        }
+
                         /* This will close nfd, regardless whether it succeeds or not */
-                        q = find_symlinks_fd(root_dir, name, nfd, p, config_path, same_name_link);
-                        if (q > 0)
-                                return 1;
+                        q = find_symlinks_fd(root_dir, name, nfd, p, config_path, same_name_link, de->d_name, enable_masked_targets, enabled_targets);
                         if (r == 0)
                                 r = q;
 
@@ -798,10 +807,20 @@ static int find_symlinks_fd(
                                 b = path_equal(t, p);
                         }
 
+                        /* Check if the symlink points to /dev/null */
+                        if (found_path && null_or_empty_path(p) > 0) {
+                                if (dir_name != NULL) {
+                                        set_put_strdup(enable_masked_targets, dir_name);
+                                        continue;
+                                }
+                        }
+
                         if (b)
                                 *same_name_link = true;
-                        else if (found_path || found_dest)
-                                return 1;
+                        else if (found_path || found_dest) {
+                                if (dir_name != NULL)
+                                        set_put_strdup(enabled_targets, dir_name);
+                        }
                 }
         }
 
@@ -812,13 +831,17 @@ static int find_symlinks(
                 const char *root_dir,
                 const char *name,
                 const char *config_path,
-                bool *same_name_link) {
+                bool *same_name_link,
+                Set *enable_masked_targets,
+                Set *enabled_targets) {
 
         int fd;
 
         assert(name);
         assert(config_path);
         assert(same_name_link);
+        assert(enable_masked_targets);
+        assert(enabled_targets);
 
         fd = open(config_path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC);
         if (fd < 0) {
@@ -828,7 +851,7 @@ static int find_symlinks(
         }
 
         /* This takes possession of fd and closes it */
-        return find_symlinks_fd(root_dir, name, fd, config_path, config_path, same_name_link);
+        return find_symlinks_fd(root_dir, name, fd, config_path, config_path, same_name_link, NULL, enable_masked_targets, enabled_targets);
 }
 
 static int find_symlinks_in_scope(
@@ -839,18 +862,40 @@ static int find_symlinks_in_scope(
         bool same_name_link_runtime = false, same_name_link_config = false;
         bool enabled_in_runtime = false, enabled_at_all = false;
         char **p;
+        void *t;
         int r;
+        _cleanup_set_free_free_ Set *enable_masked_targets = NULL;
+        Iterator i;
 
         assert(paths);
         assert(name);
 
-        STRV_FOREACH(p, paths->search_path)  {
-                bool same_name_link = false;
+        enable_masked_targets = set_new(&string_hash_ops);
+        if (!enable_masked_targets)
+                return -ENOMEM;
 
-                r = find_symlinks(paths->root_dir, name, *p, &same_name_link);
+        STRV_FOREACH(p, paths->search_path)  {
+                bool same_name_link = false, masked = true;
+                _cleanup_set_free_free_ Set *enabled_targets = NULL;
+
+                enabled_targets = set_new(&string_hash_ops);
+                if (!enabled_targets)
+                        return -ENOMEM;
+
+                r = find_symlinks(paths->root_dir, name, *p, &same_name_link, enable_masked_targets, enabled_targets);
                 if (r < 0)
                         return r;
-                if (r > 0) {
+                if (!set_isempty(enabled_targets)) {
+
+                        SET_FOREACH(t, enabled_targets, i) {
+                                if (!set_contains(enable_masked_targets, t)) {
+                                        masked = false;
+                                }
+                        }
+
+                        if (masked)
+                                continue;
+
                         /* We found symlinks in this dir? Yay! Let's see where precisely it is enabled. */
 
                         r = path_is_config(paths, *p, false);
@@ -858,6 +903,14 @@ static int find_symlinks_in_scope(
                                 return r;
                         if (r > 0) {
                                 /* This is the best outcome, let's return it immediately. */
+                                *state = UNIT_FILE_ENABLED;
+                                return 1;
+                        }
+
+                        r = path_is_vendor(paths, *p);
+                        if (r < 0)
+                                return r;
+                        if (r > 0) {
                                 *state = UNIT_FILE_ENABLED;
                                 return 1;
                         }
